@@ -3,6 +3,7 @@ import copy
 import http.client
 import json
 import shutil
+from io import BytesIO
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -14,6 +15,9 @@ from PIL import Image
 import nodes
 from comfy_api.latest import ComfyExtension, io
 from custom_nodes import comfyui_to_eagle as eagle
+from custom_nodes.comfyui_png_provenance import SaveImageWithProvenance
+from custom_nodes.comfyui_png_provenance.png_bundle import read_png_bundle
+from custom_nodes.comfyui_png_provenance.restore import restore_png
 from execution import PromptExecutor
 
 
@@ -50,7 +54,7 @@ def test_extension_loads_v3_schema():
     schema = node.GET_SCHEMA()
     assert schema.is_output_node
     assert not schema.outputs
-    assert {item.id for item in schema.inputs} == {"images", "name", "tags", "annotation"}
+    assert {item.id for item in schema.inputs} == {"images", "name", "tags", "annotation", "png_data"}
 
 
 @pytest.mark.parametrize("batch_size,channels", [(1, 3), (2, 4)])
@@ -108,6 +112,104 @@ def test_image_name_is_not_used_as_a_path(local_api, tmp_path):
     assert path.name == "image_00001.png"
     assert path.exists()
     assert not (tmp_path / "outside").exists()
+
+
+def test_png_input_preserves_bytes_and_takes_priority(local_api, tmp_path, monkeypatch):
+    buffer = BytesIO()
+    Image.new("RGBA", (2, 3), (17, 32, 128, 89)).save(buffer, format="PNG")
+    data = buffer.getvalue()
+    monkeypatch.setattr(eagle.ui.ImageSaveHelper, "_convert_tensor_to_pil", MagicMock(side_effect=AssertionError("PNG must not be converted")))
+    eagle.SendImageToEagle.execute(torch.zeros(2, 2, 2, 3), "saved.png", annotation="Description", png_data=data)
+    post = local_api[1].request.call_args
+    item, = json.loads(post.kwargs["body"])["items"]
+    assert item["name"] == "saved.png"
+    assert item["annotation"] == "Description"
+    copied, = (tmp_path / "library" / "images").glob("*.info\\original.png")
+    assert copied.read_bytes() == data
+    assert not Path(item["path"]).exists()
+
+
+@pytest.mark.parametrize("data", [b"", b"not PNG", "not bytes"])
+def test_invalid_png_does_not_fall_back_to_images(local_api, tmp_path, data):
+    with pytest.raises(ValueError, match="PNG bytes"):
+        eagle.SendImageToEagle.execute(torch.zeros(1, 2, 2, 3), png_data=data)
+    local_api[0].assert_not_called()
+    assert not (tmp_path / "temp").exists()
+
+
+def test_missing_image_input_reports_error(local_api):
+    with pytest.raises(ValueError, match="Connect images or png_data"):
+        eagle.SendImageToEagle.execute()
+    local_api[0].assert_not_called()
+
+
+def test_png_import_failure_keeps_exact_bytes(local_api, tmp_path):
+    buffer = BytesIO()
+    Image.new("RGB", (1, 1)).save(buffer, format="PNG")
+    data = buffer.getvalue()
+    local_api[1].request.side_effect = ConnectionRefusedError("refused")
+    with pytest.raises(RuntimeError, match="Eagle import failed"):
+        eagle.SendImageToEagle.execute(png_data=data)
+    path, = (tmp_path / "temp").glob("eagle_*\\image_00001.png")
+    assert path.read_bytes() == data
+
+
+def test_provenance_batch_sockets_preserve_imported_files(local_api, tmp_path, monkeypatch):
+    source_dir = tmp_path / "input"
+    output_dir = tmp_path / "output"
+    source_dir.mkdir()
+    output_dir.mkdir()
+    source = source_dir / "source.png"
+    Image.new("RGB", (3, 2), (17, 32, 128)).save(source)
+    monkeypatch.setattr(eagle.folder_paths, "get_input_directory", lambda: str(source_dir))
+    monkeypatch.setattr(eagle.folder_paths, "get_output_directory", lambda: str(output_dir))
+    monkeypatch.setitem(nodes.NODE_CLASS_MAPPINGS, "SaveImageWithProvenance", SaveImageWithProvenance)
+    monkeypatch.setitem(nodes.NODE_CLASS_MAPPINGS, "SendImageToEagle", eagle.SendImageToEagle)
+    imported = []
+
+    def respond():
+        call = local_api[1].request.call_args
+        if call.args[0] == "GET":
+            return json.dumps({"status": "success", "data": {"library": {"path": str(tmp_path / "library")}}}).encode()
+        item, = json.loads(call.kwargs["body"])["items"]
+        item_id = f"import{len(imported)}"
+        directory = tmp_path / "library" / "images" / f"{item_id}.info"
+        directory.mkdir(parents=True)
+        copied = directory / "original.png"
+        shutil.copyfile(item["path"], copied)
+        imported.append((item, copied))
+        return json.dumps({"status": "success", "data": [item_id]}).encode()
+
+    local_api[1].getresponse.return_value.read.side_effect = respond
+    prompt = {
+        "1": {"class_type": "LoadImage", "inputs": {"image": "source.png"}},
+        "2": {"class_type": "ImageBatch", "inputs": {"image1": ["1", 0], "image2": ["1", 0]}},
+        "3": {"class_type": "SaveImageWithProvenance", "inputs": {"images": ["2", 0], "filename_prefix": "batch"}},
+        "4": {"class_type": "SendImageToEagle", "inputs": {
+            "png_data": ["3", 0], "name": ["3", 1], "annotation": ["3", 2], "tags": "provenance",
+        }},
+    }
+    executor = PromptExecutor(Server(), cache_type=False, cache_args={"ram": 0, "ram_inactive": 0})
+    executor.execute(prompt, "provenance-eagle", execute_outputs=["4"])
+    assert executor.success, executor.status_messages
+    previews = executor.history_result["outputs"]["3"]["images"]
+    assert len(imported) == len(previews) == 2
+    for index, ((item, copied), preview) in enumerate(zip(imported, previews)):
+        saved = output_dir / preview["filename"]
+        assert copied.read_bytes() == saved.read_bytes()
+        assert item["name"] == saved.name
+        assert item["tags"] == ["provenance"]
+        with Image.open(copied) as image:
+            assert item["annotation"] == image.info["Description"]
+        manifest, files = read_png_bundle(copied)
+        assert set(manifest["graph"]) == {"1", "2", "3"}
+        assert manifest["output"]["batch_index"] == index
+        assert list(files.values()) == [source.read_bytes()]
+        destination = tmp_path / f"restored_{index}"
+        assert restore_png(copied, destination) == []
+        restored_prompt = json.loads((destination / "prompt.json").read_text("utf-8"))
+        assert (destination / restored_prompt["1"]["inputs"]["image"]).read_bytes() == source.read_bytes()
+        assert not Path(item["path"]).exists()
 
 
 @pytest.mark.parametrize(

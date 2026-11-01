@@ -1,6 +1,6 @@
 # Send Image to Eagle
 
-ComfyUIのIMAGEバッチを、同じPCで起動しているEagleの現在のライブラリにPNGとして登録するV3出力ノードです。
+ComfyUIのIMAGEバッチ、または完成済みPNGバイト列を、同じPCで起動しているEagleの現在のライブラリに登録するV3出力ノードです。
 
 ## 使い方
 
@@ -10,12 +10,25 @@ ComfyUIのIMAGEバッチを、同じPCで起動しているEagleの現在のラ�
 
 | 入力 | 内容 |
 |---|---|
-| `images` | バッチ全件を登録 |
-| `name` | Eagle上の画像名。既定は `ComfyUI`。バッチでは `_00001` からの連番を付与 |
+| `images` | 任意。IMAGEバッチ全件をPNGに変換して登録 |
+| `name` | Eagle上の画像名。既定は `ComfyUI`。IMAGEバッチでは `_00001` からの連番を付与 |
 | `tags` | カンマ区切り。例: `生成画像, イラスト` |
 | `annotation` | 注釈。複数行・日本語対応 |
+| `png_data` | 任意。`PNG_DATA` 型のPNGバイト列を再エンコードせず登録。`images` より優先 |
 
-出力ソケット・プレビュー・フォルダ指定・ワークフロー情報の埋め込みはありません。同じ入力でも実行するたびに登録するため、重複する場合があります。
+`images` または `png_data` のどちらかを接続してください。出力ソケット・プレビュー・フォルダ指定はありません。ワークフロー情報を新たに埋め込みませんが、PNG入力に既に含まれるメタデータはそのまま保持します。同じ入力でも実行するたびに登録するため、重複する場合があります。
+
+## Save Image with Provenanceとの接続
+
+`custom_nodes\comfyui_png_provenance` を配置・更新し、両ノードの変更後にComfyUIを再起動してブラウザーを再読み込みします。
+
+| Save Image with Provenanceの出力 | このノードの入力 |
+|---|---|
+| `PNG data` | `png_data` |
+| `filename` | `name` |
+| `Description` | `annotation` |
+
+`name` と `annotation` のウィジェットを入力ソケットに変換して接続してください。バッチ全件が対応するファイル名・Descriptionで画像ごとに登録されます。PNG入力では `name` に追加の連番を付けません。内包された入力画像や生成グラフも保持し、保存ノードがoutputに作成したPNGは削除しません。
 
 ## 一時画像とエラー
 

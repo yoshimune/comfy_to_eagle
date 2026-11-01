@@ -85,10 +85,11 @@ class SendImageToEagle(io.ComfyNode):
             category="image/Eagle",
             description="Send images to the running local Eagle library. Each execution imports again.",
             inputs=[
-                io.Image.Input("images"),
+                io.Image.Input("images", optional=True),
                 io.String.Input("name", default="ComfyUI"),
                 io.String.Input("tags", default="", tooltip="Comma-separated Eagle tags."),
                 io.String.Input("annotation", default="", multiline=True),
+                io.Custom("PNG_DATA").Input("png_data", optional=True, tooltip="Send the original PNG bytes, preserving embedded metadata. Takes priority over images."),
             ],
             is_output_node=True,
         )
@@ -98,20 +99,30 @@ class SendImageToEagle(io.ComfyNode):
         return float("NaN")
 
     @classmethod
-    def execute(cls, images, name="ComfyUI", tags="", annotation=""):
+    def execute(cls, images=None, name="ComfyUI", tags="", annotation="", png_data=None):
+        if png_data is not None:
+            if not isinstance(png_data, bytes) or not png_data.startswith(b"\x89PNG\r\n\x1a\n"):
+                raise ValueError("png_data must contain PNG bytes.")
+        elif images is None:
+            raise ValueError("Connect images or png_data to Send Image to Eagle.")
+        image_count = 1 if png_data is not None else len(images)
         temp_root = os.path.abspath(folder_paths.get_temp_directory())
         os.makedirs(temp_root, exist_ok=True)
         directory = tempfile.mkdtemp(prefix="eagle_", dir=temp_root)
         tag_list = [tag.strip() for tag in tags.split(",") if tag.strip()]
         items = []
         try:
-            for index, image in enumerate(images):
+            for index in range(image_count):
                 path = os.path.join(directory, f"image_{index + 1:05}.png")
-                with ui.ImageSaveHelper._convert_tensor_to_pil(image) as png:
-                    png.save(path, format="PNG", compress_level=4)
+                if png_data is not None:
+                    with open(path, "wb") as file:
+                        file.write(png_data)
+                else:
+                    with ui.ImageSaveHelper._convert_tensor_to_pil(images[index]) as png:
+                        png.save(path, format="PNG", compress_level=4)
                 items.append({
                     "path": path,
-                    "name": f"{name}_{index + 1:05}" if len(images) > 1 else name,
+                    "name": f"{name}_{index + 1:05}" if image_count > 1 else name,
                     "tags": tag_list,
                     "annotation": annotation,
                 })
